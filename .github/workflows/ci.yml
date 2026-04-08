@@ -1,135 +1,239 @@
-name: EasyResto CI (Dev Mode)
+name: EasyResto CI Pipeline
 
 on:
-  push:
-    branches: ["main", "develop"]
   pull_request:
+    branches: ["main", "develop"]
+  push:
     branches: ["main", "develop"]
   workflow_dispatch:
 
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
 
+# ==============================================================
+# JOB 1 — PHP SYNTAX CHECK
+# ==============================================================
+
   php-lint:
-    name: PHP Syntax Check
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Cek apakah folder src ada
-        run: |
-          if [ ! -d "src" ]; then
-            echo "src/ belum ada, skip PHP lint"
-            exit 0
-          fi
-
-      - name: Setup PHP
-        uses: shivammathur/setup-php@v2
+      - uses: shivammathur/setup-php@v2
         with:
           php-version: "8.2"
 
       - name: Lint PHP
         run: |
-          files=$(find src/ -name "*.php")
-          if [ -z "$files" ]; then
-            echo "Tidak ada file PHP, skip"
+          if [ ! -d "src" ]; then
+            echo "⚠️ src belum ada → SKIP"
             exit 0
           fi
 
-          error=0
-          for file in $files; do
-            out=$(php -l "$file" 2>&1)
+          fail=0
+          while IFS= read -r -d '' f; do
+            out=$(php -l "$f" 2>&1)
             if echo "$out" | grep -qE "Parse error|Fatal error"; then
-              echo "ERROR: $file"
-              echo "$out"
-              error=1
+              echo "$f → $out"
+              fail=1
             else
-              echo "OK: $file"
+              echo "OK: $f"
+            fi
+          done < <(find src/ -name "*.php" -print0)
+
+          if [ $fail -eq 1 ]; then
+            exit 1
+          fi
+
+# ==============================================================
+# JOB 2 — DATABASE VALIDATION
+# ==============================================================
+
+  db-validate:
+    runs-on: ubuntu-latest
+
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: easyresto
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h localhost -uroot -proot"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tunggu MySQL
+        run: |
+          for i in {1..30}; do
+            if mysqladmin ping -h 127.0.0.1 -uroot -proot --silent; then
+              echo "✅ MySQL siap"
+              break
+            fi
+            echo "($i/30) Menunggu MySQL..."
+            sleep 2
+          done
+
+      - name: Import SQL
+        run: |
+          SQL=$(find . -name "*.sql" | head -n 1)
+
+          if [ -z "$SQL" ]; then
+            echo "⚠️ SQL belum ada → SKIP"
+            exit 0
+          fi
+
+          mysql -h 127.0.0.1 -uroot -proot < "$SQL"
+
+      - name: Cek tabel
+        run: |
+          for tbl in users menu kategori_menu transaksi detail_transaksi; do
+            res=$(mysql -h 127.0.0.1 -uroot -proot easyresto -se "SHOW TABLES LIKE '$tbl';")
+            if [ -z "$res" ]; then
+              echo "⚠️ $tbl belum ada"
+            else
+              echo "✅ $tbl"
             fi
           done
 
-          [ $error -eq 1 ] && exit 1
+# ==============================================================
+# JOB 3 — FUNCTIONAL TEST
+# ==============================================================
 
-
-  security-audit:
-    name: Security Basic Check
+  functional-test:
     runs-on: ubuntu-latest
+    needs: db-validate
+
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: easyresto
+        ports:
+          - 3306:3306
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Skip jika src belum ada
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.2"
+          extensions: mysqli
+
+      - name: Tunggu MySQL
         run: |
-          [ ! -d "src" ] && echo "skip security check" && exit 0
+          for i in {1..30}; do
+            if mysqladmin ping -h 127.0.0.1 -uroot -proot --silent; then
+              echo "✅ MySQL siap"
+              break
+            fi
+            sleep 2
+          done
+
+      - name: Import SQL
+        run: |
+          SQL=$(find . -name "*.sql" | head -n 1)
+
+          if [ -z "$SQL" ]; then
+            echo "⚠️ Tidak ada SQL → SKIP TEST"
+            exit 0
+          fi
+
+          mysql -h 127.0.0.1 -uroot -proot < "$SQL"
+
+      - name: Test koneksi
+        run: |
+          php -r "
+          \$conn = new mysqli('127.0.0.1','root','root','easyresto');
+          if(\$conn->connect_error){
+            echo 'FAIL koneksi';
+            exit(1);
+          }
+          echo '✅ DB Connected';
+          "
+
+# ==============================================================
+# JOB 4 — SECURITY AUDIT
+# ==============================================================
+
+  security-audit:
+    runs-on: ubuntu-latest
+    needs: php-lint
+
+    steps:
+      - uses: actions/checkout@v4
 
       - name: Cek MD5
         run: |
-          grep -r "md5(" src/ || echo "OK: tidak ada MD5"
-
-      - name: Cek SQL Injection sederhana
-        run: |
-          risky=$(grep -rn --include="*.php" \
-          -E 'query\s*\(\s*"[^"]*\$_(GET|POST)' src/ || true)
-
-          if [ -n "$risky" ]; then
-            echo "WARNING SQL Injection risk:"
-            echo "$risky"
-          else
-            echo "OK: tidak ditemukan pola SQL injection"
+          if [ ! -d "src" ]; then
+            echo "⚠️ src belum ada → SKIP"
+            exit 0
           fi
 
+          files=$(grep -rln "md5(" src/ || true)
+
+          if [ -n "$files" ]; then
+            echo "⚠️ MD5 ditemukan"
+          else
+            echo "✅ Aman"
+          fi
+
+# ==============================================================
+# JOB 5 — STRUKTUR FILE (FIXED)
+# ==============================================================
 
   structure-check:
-    name: Struktur (Soft Check)
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Cek folder src
+      - name: Cek folder src (FIXED)
         run: |
           if [ ! -d "src" ]; then
-            echo "WARNING: src/ belum dibuat"
+            echo "⚠️ Folder src belum ada → SKIP"
             exit 0
           fi
 
-      - name: Cek file penting (tidak fail)
+          echo "✅ src ditemukan"
+
+      - name: Cek file penting
         run: |
-          for f in \
-          src/config.php src/login.php src/register.php
-          do
-            [ ! -f "$f" ] && echo "WARNING Missing $f" || echo "OK $f"
+          if [ ! -d "src" ]; then
+            echo "⚠️ Skip karena src belum ada"
+            exit 0
+          fi
+
+          for f in src/config.php src/login.php src/register.php; do
+            if [ ! -f "$f" ]; then
+              echo "⚠️ $f belum ada"
+            else
+              echo "✅ $f"
+            fi
           done
 
-
-  db-check:
-    name: Database Check (Optional)
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Cek file SQL
-        run: |
-          SQL_FILE=$(find . -name "*.sql" | head -n 1)
-          if [ -z "$SQL_FILE" ]; then
-            echo "WARNING: file SQL belum ada"
-            exit 0
-          else
-            echo "OK: ditemukan $SQL_FILE"
-          fi
-
+# ==============================================================
+# JOB 6 — REPORT
+# ==============================================================
 
   report:
-    name: Laporan CI
     runs-on: ubuntu-latest
-    needs: [php-lint, security-audit, structure-check, db-check]
-    if: always()
+    needs: [php-lint, db-validate, functional-test, security-audit, structure-check]
+    if: always() && github.event_name == 'pull_request'
 
     steps:
-      - name: Output hasil
+      - name: Report
         run: |
-          echo "PHP Lint: ${{ needs.php-lint.result }}"
-          echo "Security: ${{ needs.security-audit.result }}"
-          echo "Structure: ${{ needs.structure-check.result }}"
-          echo "Database: ${{ needs.db-check.result }}"
+          echo "CI selesai"
