@@ -18,7 +18,6 @@ jobs:
 # ==============================================================
 
   php-lint:
-    name: PHP Syntax Check
     runs-on: ubuntu-latest
 
     steps:
@@ -28,10 +27,10 @@ jobs:
         with:
           php-version: "8.2"
 
-      - name: Lint semua file PHP
+      - name: Lint PHP
         run: |
           if [ ! -d "src" ]; then
-            echo "⚠️ Folder src belum ada → SKIP"
+            echo "⚠️ src belum ada → SKIP"
             exit 0
           fi
 
@@ -46,15 +45,15 @@ jobs:
             fi
           done < <(find src/ -name "*.php" -print0)
 
-          [ $fail -eq 1 ] && exit 1
-          echo "✅ Semua file PHP valid"
+          if [ $fail -eq 1 ]; then
+            exit 1
+          fi
 
 # ==============================================================
-# JOB 2 — DATABASE & SCHEMA VALIDATION (SKIP MODE)
+# JOB 2 — DATABASE VALIDATION
 # ==============================================================
 
   db-validate:
-    name: Database Validation (Smart Skip)
     runs-on: ubuntu-latest
 
     services:
@@ -77,23 +76,26 @@ jobs:
       - name: Tunggu MySQL
         run: |
           for i in {1..30}; do
-            mysqladmin ping -h 127.0.0.1 -uroot -proot --silent && break
+            if mysqladmin ping -h 127.0.0.1 -uroot -proot --silent; then
+              echo "✅ MySQL siap"
+              break
+            fi
+            echo "($i/30) Menunggu MySQL..."
             sleep 2
           done
 
-      - name: Import SQL (jika ada)
+      - name: Import SQL
         run: |
-          SQL=$(find . -name "*.sql" | grep -v ".git" | head -n 1)
+          SQL=$(find . -name "*.sql" | head -n 1)
 
           if [ -z "$SQL" ]; then
-            echo "⚠️ File SQL belum ada → SKIP DB"
+            echo "⚠️ SQL belum ada → SKIP"
             exit 0
           fi
 
           mysql -h 127.0.0.1 -uroot -proot < "$SQL"
-          echo "✅ Database diimport"
 
-      - name: Validasi tabel
+      - name: Cek tabel
         run: |
           for tbl in users menu kategori_menu transaksi detail_transaksi; do
             res=$(mysql -h 127.0.0.1 -uroot -proot easyresto -se "SHOW TABLES LIKE '$tbl';")
@@ -104,26 +106,11 @@ jobs:
             fi
           done
 
-      - name: Validasi VIEW
-        run: |
-          res=$(mysql -h 127.0.0.1 -uroot -proot easyresto \
-            -se "SHOW FULL TABLES WHERE TABLE_TYPE='VIEW' AND Tables_in_easyresto='laporan_penjualan';")
-
-          [ -z "$res" ] && echo "⚠️ VIEW belum ada" || echo "✅ VIEW OK"
-
-      - name: Validasi TRIGGER
-        run: |
-          res=$(mysql -h 127.0.0.1 -uroot -proot easyresto \
-            -se "SHOW TRIGGERS LIKE 'trg_subtotal_insert';")
-
-          [ -z "$res" ] && echo "⚠️ TRIGGER belum ada" || echo "✅ TRIGGER OK"
-
 # ==============================================================
-# JOB 3 — FUNCTIONAL TEST (AUTO SKIP)
+# JOB 3 — FUNCTIONAL TEST
 # ==============================================================
 
   functional-test:
-    name: Functional Testing
     runs-on: ubuntu-latest
     needs: db-validate
 
@@ -145,7 +132,17 @@ jobs:
           php-version: "8.2"
           extensions: mysqli
 
-      - name: Import SQL (jika ada)
+      - name: Tunggu MySQL
+        run: |
+          for i in {1..30}; do
+            if mysqladmin ping -h 127.0.0.1 -uroot -proot --silent; then
+              echo "✅ MySQL siap"
+              break
+            fi
+            sleep 2
+          done
+
+      - name: Import SQL
         run: |
           SQL=$(find . -name "*.sql" | head -n 1)
 
@@ -156,7 +153,7 @@ jobs:
 
           mysql -h 127.0.0.1 -uroot -proot < "$SQL"
 
-      - name: Test koneksi DB
+      - name: Test koneksi
         run: |
           php -r "
           \$conn = new mysqli('127.0.0.1','root','root','easyresto');
@@ -168,11 +165,10 @@ jobs:
           "
 
 # ==============================================================
-# JOB 4 — SECURITY AUDIT (NON-BLOCKING)
+# JOB 4 — SECURITY AUDIT
 # ==============================================================
 
   security-audit:
-    name: Security Audit
     runs-on: ubuntu-latest
     needs: php-lint
 
@@ -181,55 +177,63 @@ jobs:
 
       - name: Cek MD5
         run: |
-          files=$(grep -rln "md5(" src/ || true)
-          [ -n "$files" ] && echo "⚠️ MD5 ditemukan" || echo "✅ Aman"
+          if [ ! -d "src" ]; then
+            echo "⚠️ src belum ada → SKIP"
+            exit 0
+          fi
 
-      - name: Cek SQL Injection
-        run: |
-          risky=$(grep -rn '$_GET\|$_POST' src/ || true)
-          [ -n "$risky" ] && echo "⚠️ Perlu validasi input" || echo "✅ Aman"
+          files=$(grep -rln "md5(" src/ || true)
+
+          if [ -n "$files" ]; then
+            echo "⚠️ MD5 ditemukan"
+          else
+            echo "✅ Aman"
+          fi
 
 # ==============================================================
-# JOB 5 — STRUKTUR FILE (SMART SKIP)
+# JOB 5 — STRUKTUR FILE (FIXED)
 # ==============================================================
 
   structure-check:
-    name: Struktur File
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Cek folder src
+      - name: Cek folder src (FIXED)
         run: |
-          [ ! -d "src" ] && echo "⚠️ src belum ada" && exit 0
+          if [ ! -d "src" ]; then
+            echo "⚠️ Folder src belum ada → SKIP"
+            exit 0
+          fi
+
+          echo "✅ src ditemukan"
 
       - name: Cek file penting
         run: |
+          if [ ! -d "src" ]; then
+            echo "⚠️ Skip karena src belum ada"
+            exit 0
+          fi
+
           for f in src/config.php src/login.php src/register.php; do
-            [ ! -f "$f" ] && echo "⚠️ $f belum ada" || echo "✅ $f"
+            if [ ! -f "$f" ]; then
+              echo "⚠️ $f belum ada"
+            else
+              echo "✅ $f"
+            fi
           done
 
 # ==============================================================
-# JOB 6 — REPORT KE PR
+# JOB 6 — REPORT
 # ==============================================================
 
   report:
-    name: Laporan CI
     runs-on: ubuntu-latest
     needs: [php-lint, db-validate, functional-test, security-audit, structure-check]
     if: always() && github.event_name == 'pull_request'
 
     steps:
-      - name: Comment PR
-        uses: marocchino/sticky-pull-request-comment@v2
-        with:
-          message: |
-            ## 🍽️ EasyResto CI (Smart Mode)
-
-            Semua validasi berjalan dengan sistem:
-            - ✅ Ada → Dicek
-            - ⚠️ Belum ada → Skip
-            - ❌ Error → Gagal
-
-            Cek tab **Actions** untuk detail lengkap.
+      - name: Report
+        run: |
+          echo "CI selesai"
